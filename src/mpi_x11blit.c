@@ -15,15 +15,20 @@
  * along with this program. If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include <X11/Xlib.h>
 #include <errno.h>
 #include <limits.h>
 #include <mpi.h>
-#include <pshmem.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifdef _WIN32
+#include <Windows.h>
+#else
+#include <X11/Xlib.h>
+#include <pshmem.h>
 #include <unistd.h>
+#endif
 
 #define PROGNAME "mpi_x11blit"
 
@@ -32,34 +37,44 @@
 #define BITMAP_BPP 3
 #define BITMAP_STRIDE (BITMAP_BPP * BITMAP_WIDTH)
 
+#ifndef min
+/* Already defined by <Windows.h> */
 #define min(a, b)                                                             \
     __extension__({                                                           \
         __typeof(a) _a = a;                                                   \
         __typeof(b) _b = b;                                                   \
         _a < _b ? _a : _b;                                                    \
     })
+#endif
+
+#ifndef RGB
+/* Already defined by Windows.h */
+#define RGB(r, g, b) (((r & 0xff) << 16) | ((g & 0xff) << 8) | (b & 0xff))
+#endif
+
 #define MPI_Check(v)                                                          \
-    __extension__({                                                           \
-        __typeof(v) _v = v;                                                   \
+    {                                                                         \
+        int _v = v;                                                           \
         if (_v != MPI_SUCCESS)                                                \
             handle_error(_v, #v);                                             \
-    })
+    }
 #define MPI_Check_close(f, v)                                                 \
-    __extension__({                                                           \
-        __typeof(v) _v = v;                                                   \
+    {                                                                         \
+        int _v = v;                                                           \
         if (_v != MPI_SUCCESS) {                                              \
             MPI_File_close(f);                                                \
             handle_error(_v, #v);                                             \
         }                                                                     \
-    })
+    }
 #define _logf(d, f, ...)                                                      \
-    fprintf(d, PROGNAME "(%c%d): " f "\n", g_is_renderer ? 'r' : 'w', g_rank, \
-        ##__VA_ARGS__)
+    {                                                                         \
+        fprintf(d, PROGNAME "(%c%d): " f "\n", g_is_renderer ? 'r' : 'w',     \
+            g_rank, ##__VA_ARGS__);                                           \
+        fflush(d);                                                            \
+    }
 
 #define logf(f, ...) _logf(stdout, f, ##__VA_ARGS__)
 #define errf(f, ...) _logf(stderr, f, ##__VA_ARGS__)
-
-#define RGB(r, g, b) (((r & 0xff) << 16) | ((g & 0xff) << 8) | (b & 0xff))
 
 struct rgb_point {
     uint16_t x, y;
@@ -75,8 +90,7 @@ static int g_rank = -1, g_size = -1, g_is_renderer = 0;
  * @mpi_error: MPI status code
  * @expr: Failing expression
  */
-static void __attribute__((noreturn))
-handle_error(int mpi_error, const char *expr)
+static void handle_error(int mpi_error, const char *expr)
 {
     char msg_buf[BUFSIZ];
     int msg_len = -1;
@@ -100,6 +114,7 @@ handle_error(int mpi_error, const char *expr)
  */
 static void perform_rendering(MPI_Comm *child_comm)
 {
+#ifndef _WIN32
     /* Create window. */
     const char *display_name = getenv("DISPLAY");
     Display *display = XOpenDisplay(display_name);
@@ -144,6 +159,68 @@ static void perform_rendering(MPI_Comm *child_comm)
 
     sleep(5);
     XCloseDisplay(display);
+#else
+    HINSTANCE hInstance = GetModuleHandle(NULL);
+
+    /* Register window class. */
+    LPCSTR szClassName = PROGNAME;
+    WNDCLASSEX WndClassEx;
+    WndClassEx.cbSize = sizeof(WNDCLASSEX);
+    WndClassEx.style = 0;
+    WndClassEx.lpfnWndProc = DefWindowProc;
+    WndClassEx.cbClsExtra = 0;
+    WndClassEx.cbWndExtra = 0;
+    WndClassEx.hInstance = hInstance;
+    WndClassEx.hIcon = LoadIcon(NULL, IDI_APPLICATION);
+    WndClassEx.hCursor = LoadCursor(NULL, IDC_ARROW);
+    WndClassEx.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    WndClassEx.lpszMenuName = NULL;
+    WndClassEx.lpszClassName = szClassName;
+    WndClassEx.hIconSm = LoadIcon(NULL, IDI_APPLICATION);
+
+    if (!RegisterClassEx(&WndClassEx)) {
+        errf("window registration failed (%08x)", GetLastError());
+        MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+        MPI_Finalize();
+        _exit(EXIT_FAILURE);
+        return 0;
+    }
+
+    /* Create window. */
+    HWND hWnd = CreateWindowEx(WS_EX_CLIENTEDGE, szClassName,
+        PROGNAME, WS_OVERLAPPEDWINDOW, CW_USEDEFAULT,
+        CW_USEDEFAULT, BITMAP_WIDTH, BITMAP_HEIGHT, NULL, NULL, hInstance, NULL);
+    if (!hWnd) {
+        errf("window creation failed (%08x)", GetLastError());
+        MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+        MPI_Finalize();
+        _exit(EXIT_FAILURE);
+    }
+
+    ShowWindow(hWnd, SW_SHOW);
+    UpdateWindow(hWnd);
+
+    /* Draw bitmap. */
+    HDC hDC = GetDC(hWnd);
+
+    for (size_t i = 0; i < BITMAP_WIDTH * BITMAP_HEIGHT; i++) {
+        /* Receive RGB triplets. */
+        struct rgb_point point;
+        MPI_Recv(&point, sizeof(point), MPI_UNSIGNED_CHAR, MPI_ANY_SOURCE,
+            MPI_ANY_TAG, *child_comm, MPI_STATUS_IGNORE);
+        SetPixel(hDC, point.x, point.y, RGB(point.r, point.g, point.b));
+    }
+
+    ReleaseDC(hWnd, hDC);
+    DeleteDC(hDC);
+
+    /* Window event loop. */
+    MSG Msg;
+    while (GetMessage(&Msg, NULL, 0, 0) > 0) {
+        TranslateMessage(&Msg);
+        DispatchMessage(&Msg);
+    }    
+#endif
 }
 
 /* Reads raw RGB data from the supplied input file and sends them out so the
@@ -158,7 +235,7 @@ static void read_data(const char *input_path)
     MPI_Check(MPI_File_open(MPI_COMM_WORLD, input_path, MPI_MODE_RDONLY,
         MPI_INFO_NULL, &input_file));
 
-    /* Calculate chunk length for each peer. */
+    /* Calculate chunk length for each peer. */ 
     MPI_Offset input_len;
     MPI_Check_close(&input_file, MPI_File_get_size(input_file, &input_len));
     if (input_len % BITMAP_STRIDE) {
@@ -231,7 +308,6 @@ static int parse_num_workers(char *str)
 int main(int argc, char **argv)
 {
     if (argc != 3) {
-        printf("argc=%d\n", argc);
         printf("usage: " PROGNAME " NUM_WORKERS INPUT_FILE\n\n");
         return EXIT_SUCCESS;
     }
@@ -263,13 +339,9 @@ int main(int argc, char **argv)
         }
 
         MPI_Comm child_comm;
-        int errors[num_workers];
         char *children_argv[] = { argv[1], argv[2], NULL };
         MPI_Check(MPI_Comm_spawn(argv[0], children_argv, num_workers,
-            MPI_INFO_NULL, 0, MPI_COMM_WORLD, &child_comm, errors));
-
-        for (int i = 0; i < num_workers; i++)
-            MPI_Check(errors[i]);
+            MPI_INFO_NULL, 0, MPI_COMM_WORLD, &child_comm, MPI_ERRCODES_IGNORE));
 
         /* Perform rendering. */
         perform_rendering(&child_comm);
@@ -278,6 +350,6 @@ int main(int argc, char **argv)
         read_data(argv[2]);
     }
 
-    MPI_Check(MPI_Finalize());
+    MPI_Finalize();
     return EXIT_SUCCESS;
 }
