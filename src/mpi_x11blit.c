@@ -18,15 +18,14 @@
 #include <errno.h>
 #include <limits.h>
 #include <mpi.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 
 #ifdef _WIN32
 #include <Windows.h>
 #else
 #include <X11/Xlib.h>
-#include <pshmem.h>
 #include <unistd.h>
 #endif
 
@@ -111,55 +110,11 @@ static void handle_error(int mpi_error, const char *expr)
 
 /* Waits for incoming data from other peers in the network and renders the
  * received pixels to an X11 window.
+ * @child_comm: Communicator that spawned the worker processes
  */
 static void perform_rendering(MPI_Comm *child_comm)
 {
-#ifndef _WIN32
-    /* Create window. */
-    const char *display_name = getenv("DISPLAY");
-    Display *display = XOpenDisplay(display_name);
-    if (!display) {
-        errf("could not open display: %s", display_name);
-        MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
-        MPI_Finalize();
-        _exit(EXIT_FAILURE);
-    }
-
-    int screen_num = DefaultScreen(display);
-    Window window = XCreateSimpleWindow(display, DefaultRootWindow(display), 0,
-        0, BITMAP_WIDTH, BITMAP_HEIGHT, 0, BlackPixel(display, screen_num),
-        BlackPixel(display, screen_num));
-    XSelectInput(display, window, StructureNotifyMask);
-    XMapWindow(display, window);
-    XFlush(display);
-
-    GC ctx = XCreateGC(display, window, 0, NULL);
-    if (ctx < 0) {
-        errf("could not create GC");
-        MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
-        MPI_Finalize();
-        _exit(EXIT_FAILURE);
-    }
-
-    /* Wait for window to be created. */
-    XEvent event;
-    do {
-        XNextEvent(display, &event);
-    } while (event.type != MapNotify);
-
-    /* Receive RGB triplets. */
-    struct rgb_point point;
-    for (size_t i = 0; i < BITMAP_WIDTH * BITMAP_HEIGHT; i++) {
-        MPI_Recv(&point, sizeof(point), MPI_UNSIGNED_CHAR, MPI_ANY_SOURCE,
-            MPI_ANY_TAG, *child_comm, MPI_STATUS_IGNORE);
-        XSetForeground(display, ctx, RGB(point.r, point.g, point.b));
-        XDrawPoint(display, window, ctx, point.x, point.y);
-        XFlush(display);
-    }
-
-    sleep(5);
-    XCloseDisplay(display);
-#else
+#ifdef _WIN32
     HINSTANCE hInstance = GetModuleHandle(NULL);
 
     /* Register window class. */
@@ -187,9 +142,9 @@ static void perform_rendering(MPI_Comm *child_comm)
     }
 
     /* Create window. */
-    HWND hWnd = CreateWindowEx(WS_EX_CLIENTEDGE, szClassName,
-        PROGNAME, WS_OVERLAPPEDWINDOW, CW_USEDEFAULT,
-        CW_USEDEFAULT, BITMAP_WIDTH, BITMAP_HEIGHT, NULL, NULL, hInstance, NULL);
+    HWND hWnd = CreateWindowEx(WS_EX_CLIENTEDGE, szClassName, PROGNAME,
+        WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, BITMAP_WIDTH,
+        BITMAP_HEIGHT, NULL, NULL, hInstance, NULL);
     if (!hWnd) {
         errf("window creation failed (%08x)", GetLastError());
         MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
@@ -219,7 +174,44 @@ static void perform_rendering(MPI_Comm *child_comm)
     while (GetMessage(&Msg, NULL, 0, 0) > 0) {
         TranslateMessage(&Msg);
         DispatchMessage(&Msg);
-    }    
+    }
+#else
+    /* Open display. */
+    const char *display_name = getenv("DISPLAY");
+    Display *display = XOpenDisplay(display_name);
+    if (!display) {
+        errf("could not open display: %s", display_name);
+        MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+        MPI_Finalize();
+        _exit(EXIT_FAILURE);
+    }
+
+    /* Create window. */
+    int screen_num = DefaultScreen(display);
+    Window window = XCreateSimpleWindow(display, DefaultRootWindow(display), 0,
+        0, BITMAP_WIDTH, BITMAP_HEIGHT, 0, BlackPixel(display, screen_num),
+        BlackPixel(display, screen_num));
+    GC ctx = XCreateGC(display, window, 0, NULL);
+    XSelectInput(display, window, 0);
+    XMapWindow(display, window);
+    XFlush(display);
+
+    /* Receive RGB triplets. */
+    struct rgb_point point;
+    for (size_t i = 0; i < BITMAP_WIDTH * BITMAP_HEIGHT; i++) {
+        MPI_Recv(&point, sizeof(point), MPI_UNSIGNED_CHAR, MPI_ANY_SOURCE,
+            MPI_ANY_TAG, *child_comm, MPI_STATUS_IGNORE);
+        XSetForeground(display, ctx, RGB(point.r, point.g, point.b));
+        XDrawPoint(display, window, ctx, point.x, point.y);
+        XFlush(display);
+    }
+
+    XEvent event;
+    do {
+        XNextEvent(display, &event);
+    } while (event.type != ClientMessage);
+    XDestroyWindow(display, window);
+    XCloseDisplay(display);
 #endif
 }
 
@@ -235,7 +227,7 @@ static void read_data(const char *input_path)
     MPI_Check(MPI_File_open(MPI_COMM_WORLD, input_path, MPI_MODE_RDONLY,
         MPI_INFO_NULL, &input_file));
 
-    /* Calculate chunk length for each peer. */ 
+    /* Calculate chunk length for each peer. */
     MPI_Offset input_len;
     MPI_Check_close(&input_file, MPI_File_get_size(input_file, &input_len));
     if (input_len % BITMAP_STRIDE) {
@@ -260,7 +252,7 @@ static void read_data(const char *input_path)
     MPI_Check(MPI_File_read_at_all(input_file, chunk_start, buf, chunk_len,
         MPI_UNSIGNED_CHAR, MPI_STATUS_IGNORE));
 
-    /* Send to main process. */
+    /* Send data to renderer process. */
     MPI_Comm parent_comm;
     MPI_Comm_get_parent(&parent_comm);
 
@@ -313,7 +305,7 @@ int main(int argc, char **argv)
     }
 
     if (MPI_Init(&argc, &argv) != MPI_SUCCESS) {
-        fprintf(stderr, PROGNAME ": error: MPI initialization failed\n");
+        errf("MPI initialization failed");
         return EXIT_FAILURE;
     }
 
@@ -330,18 +322,17 @@ int main(int argc, char **argv)
         /* Spawn as many worker processes as needed. */
         int num_workers = parse_num_workers(argv[1]);
         if (num_workers < 1) {
-            fprintf(stderr,
-                PROGNAME "(%d): error: invalid number of workers (%d)\n",
-                g_rank, num_workers);
-            MPI_Check(MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE));
-            MPI_Check(MPI_Finalize());
+            errf("invalid number of workers (%d)", num_workers);
+            MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+            MPI_Finalize();
             return EXIT_FAILURE;
         }
 
         MPI_Comm child_comm;
         char *children_argv[] = { argv[1], argv[2], NULL };
-        MPI_Check(MPI_Comm_spawn(argv[0], children_argv, num_workers,
-            MPI_INFO_NULL, 0, MPI_COMM_WORLD, &child_comm, MPI_ERRCODES_IGNORE));
+        MPI_Check(
+            MPI_Comm_spawn(argv[0], children_argv, num_workers, MPI_INFO_NULL,
+                0, MPI_COMM_WORLD, &child_comm, MPI_ERRCODES_IGNORE));
 
         /* Perform rendering. */
         perform_rendering(&child_comm);
