@@ -1,21 +1,31 @@
 <div align="center">
-  <img width="100" src="https://upload.wikimedia.org/wikipedia/commons/thumb/a/a5/Glazed-Donut.jpg/220px-Glazed-Donut.jpg">
-  <h3>mpi_toroid</h3>
-  <blockquote>Toy program implementing a torus-interconnect network topology using MPI.</blockquote>
+  <img width="100" src="https://pbs.twimg.com/media/EJKt_cAX0AU9TEF?format=jpg&name=900x900">
+  <h3>mpi_x11blit</h3>
+  <blockquote>
+    Toy program that renders a raw bitmap in parallel using MPI.
+  </blockquote>
 </div>
 
 ## Build Instructions
+### *NIX
 ```shell
-$ git clone https://github.com/anpep/mpi_toroid
-$ cd mpi_toroid
+$ git clone https://github.com/anpep/mpi_x11blit
+$ cd mpi_x11blit
 $ make
-$ ./tools/generate_input.py 25 > input.dat
-$ mpirun --oversubscribe -n 26 mpi_toroid 5 input.dat
+$ mpirun -n 1 mpi_x11blit 4 input.dat
+```
+
+### Windows
+1. Download and install latest [MS-MPI runtime and SDK](https://github.com/microsoft/Microsoft-MPI/releases).
+2. Clone this repository and open the `mpi_x11blit.sln` solution.
+3. Build the project and run using `mpiexec` instead of `mpirun`:
+```
+mpiexec -n 1 x64\Release\mpi_x11blit.exe 4 input.dat
 ```
 
 ## Open-source license
 ```
-mpi_toroid -- Implements a torus-interconnect network topology using OpenMPI
+mpi_x11blit -- Renders raw RGB data supplied by peers in parallel
 Copyright (c) 2021 Ángel Pérez <angel@ttm.sh>
 
 This program is free software: you can redistribute it and/or modify
