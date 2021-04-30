@@ -4,6 +4,8 @@
   <blockquote>
     Toy program that renders a raw bitmap in parallel using MPI.
   </blockquote>
+  
+  <img src="https://i.imgur.com/wRizemN.png">
 </div>
 
 ## Build Instructions
