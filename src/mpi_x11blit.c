@@ -223,11 +223,41 @@ static void perform_rendering(MPI_Comm *child_comm)
 #endif
 }
 
+static void filter_grayscale(struct rgb_point* dest)
+{
+    uint8_t avg = (uint8_t)((dest->r + dest->g + dest->b) / 3);
+    dest->r = dest->g = dest->b = avg;
+}
+
+static void filter_invert(struct rgb_point* dest)
+{
+    dest->r = 0xff - dest->r;
+    dest->g = 0xff - dest->g;
+    dest->b = 0xff - dest->b;
+}
+
+static void filter_lighten(struct rgb_point *dest)
+{
+    float tint_factor = 0.25;
+    dest->r = dest->r + (0xff - dest->r) * tint_factor;
+    dest->g = dest->g + (0xff - dest->g) * tint_factor;
+    dest->b = dest->b + (0xff - dest->b) * tint_factor;
+}
+
+static void filter_darken(struct rgb_point *dest)
+{
+    float shade_factor = 0.25;
+    dest->r = dest->r * (1.0 - shade_factor);
+    dest->g = dest->g * (1.0 - shade_factor);
+    dest->b = dest->b * (1.0 - shade_factor);
+}
+
 /* Reads raw RGB data from the supplied input file and sends them out so the
  * renderer process can blit those pixels.
  * @input_path: Path to the file containing the data
+ * @filters: Filter string
  */
-static void read_data(const char *input_path)
+static void read_data(const char *input_path, const char *filters)
 {
     /* Open input file. */
     MPI_File input_file;
@@ -265,15 +295,35 @@ static void read_data(const char *input_path)
     MPI_Comm_get_parent(&parent_comm);
 
     size_t strides = chunk_len / BITMAP_BPP;
+    size_t num_filters = filters ? strlen(filters) : 0;
     struct rgb_point point;
-
     for (size_t off = 0; off < strides; off++) {
+        point.x = (chunk_start / BITMAP_BPP + off) % BITMAP_WIDTH;
+        point.y = (chunk_start / BITMAP_BPP + off) / BITMAP_WIDTH;
+
         uint8_t *triplet = buf + (off * BITMAP_BPP);
-        point.x = (chunk_start / 3 + off) % BITMAP_WIDTH;
-        point.y = (chunk_start / 3 + off) / BITMAP_WIDTH;
         point.r = triplet[0];
         point.g = triplet[1];
         point.b = triplet[2];
+
+        /* Apply filters as per the supplied filter string */
+        for (size_t i = 0; i < num_filters; i++) {
+            switch (filters[i]) {
+            case 'g':
+                filter_grayscale(&point);
+                break;
+            case 'i':
+                filter_invert(&point);
+                break;
+            case 'l':
+                filter_lighten(&point);
+                break;
+            case 'd':
+                filter_darken(&point);
+                break;
+            }
+        }
+
         MPI_Check(MPI_Send(
             &point, sizeof(point), MPI_UNSIGNED_CHAR, 0, 0, parent_comm));
     }
@@ -307,8 +357,8 @@ static int parse_num_workers(char *str)
  */
 int main(int argc, char **argv)
 {
-    if (argc != 3) {
-        printf("usage: " PROGNAME " NUM_WORKERS INPUT_FILE\n\n");
+    if (argc < 3) {
+        printf("usage: " PROGNAME " NUM_WORKERS INPUT_FILE [FILTERS]\n\n");
         return EXIT_SUCCESS;
     }
 
@@ -339,15 +389,26 @@ int main(int argc, char **argv)
         }
 
         MPI_Comm child_comm;
-        char *children_argv[] = { argv[1], argv[2], NULL };
+        char *children_argv[] = { argv[1], argv[2], NULL, NULL };
+
+        if (argc >= 4) {
+            /* Add filter string. */
+            children_argv[2] = argv[3];
+        }
+
         MPI_Check(MPI_Comm_spawn(argv[0], children_argv, num_workers,
             MPI_INFO_NULL, 0, MPI_COMM_WORLD, &child_comm, MPI_ERRCODES_IGNORE));
 
         /* Perform rendering. */
         perform_rendering(&child_comm);
     } else {
-        /* Perform parallel read. */
-        read_data(argv[2]);
+       /* Obtain filter string from command line arguments. */
+        char *filter = NULL;
+        if (argc > 3)
+            filter = argv[3];
+
+         /* Perform parallel read. */
+        read_data(argv[2], filter);
     }
 
     MPI_Finalize();
