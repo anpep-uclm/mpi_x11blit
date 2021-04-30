@@ -320,6 +320,7 @@ static void read_data(const char *input_path, const char *filters)
             &point, sizeof(point), MPI_UNSIGNED_CHAR, 0, 0, parent_comm));
     }
 
+    free(buf);
     MPI_Check(MPI_File_close(&input_file));
 }
 
@@ -388,7 +389,7 @@ int main(int argc, char **argv)
 
         MPI_Check(MPI_Comm_spawn(argv[0], children_argv, num_workers,
             MPI_INFO_NULL, 0, MPI_COMM_WORLD, &child_comm, MPI_ERRCODES_IGNORE));
-        
+
         /* Perform rendering. */
         perform_rendering(&child_comm);
     } else {
