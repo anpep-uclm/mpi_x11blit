@@ -26,6 +26,7 @@
 #include <Windows.h>
 #else
 #include <X11/Xlib.h>
+#include <string.h>
 #include <unistd.h>
 #endif
 
@@ -81,6 +82,7 @@ struct rgb_point {
 };
 
 static int g_rank = -1, g_size = -1, g_is_renderer = 0;
+static MPI_Datatype g_point_type;
 
 /* Generic MPI error handler.
  * This function gets called from within the MPI_Check() macro in case a MPI
@@ -199,7 +201,7 @@ static void perform_rendering(MPI_Comm *child_comm)
     /* Receive RGB triplets. */
     struct rgb_point point;
     for (size_t i = 0; i < BITMAP_WIDTH * BITMAP_HEIGHT; i++) {
-        MPI_Recv(&point, sizeof(point), MPI_UNSIGNED_CHAR, MPI_ANY_SOURCE,
+        MPI_Recv(&point, 1, g_point_type, MPI_ANY_SOURCE,
             MPI_ANY_TAG, *child_comm, MPI_STATUS_IGNORE);
         XSetForeground(display, ctx, RGB(point.r, point.g, point.b));
         XDrawPoint(display, window, ctx, point.x, point.y);
@@ -215,13 +217,13 @@ static void perform_rendering(MPI_Comm *child_comm)
 #endif
 }
 
-static void filter_grayscale(struct rgb_point* dest)
+static void filter_grayscale(struct rgb_point *dest)
 {
     uint8_t avg = (uint8_t)((dest->r + dest->g + dest->b) / 3);
     dest->r = dest->g = dest->b = avg;
 }
 
-static void filter_invert(struct rgb_point* dest)
+static void filter_invert(struct rgb_point *dest)
 {
     dest->r = 0xff - dest->r;
     dest->g = 0xff - dest->g;
@@ -279,8 +281,14 @@ static void read_data(const char *input_path, const char *filters)
     uint8_t *buf = malloc(chunk_len);
 
     /* Read from file. */
-    MPI_Check(MPI_File_read_at_all(input_file, chunk_start, buf, chunk_len,
-        MPI_UNSIGNED_CHAR, MPI_STATUS_IGNORE));
+    MPI_Datatype element_type = MPI_BYTE;
+    MPI_Datatype array_type;
+    MPI_Check(MPI_Type_contiguous(chunk_len, element_type, &array_type));
+    MPI_Check(MPI_Type_commit(&array_type));
+    MPI_Check(MPI_File_set_view(input_file, chunk_start, element_type,
+        array_type, "native", MPI_INFO_NULL));
+    MPI_Check(MPI_File_read(
+        input_file, buf, chunk_len, MPI_BYTE, MPI_STATUS_IGNORE));
 
     /* Send data to renderer process. */
     MPI_Comm parent_comm;
@@ -290,8 +298,9 @@ static void read_data(const char *input_path, const char *filters)
     size_t num_filters = filters ? strlen(filters) : 0;
     struct rgb_point point;
     for (size_t off = 0; off < strides; off++) {
-        point.x = (chunk_start / BITMAP_BPP + off) % BITMAP_WIDTH;
-        point.y = (chunk_start / BITMAP_BPP + off) / BITMAP_WIDTH;
+        size_t i = chunk_start / BITMAP_BPP + off;
+        point.x = (i) % BITMAP_WIDTH;
+        point.y = (i) / BITMAP_WIDTH;
 
         uint8_t *triplet = buf + (off * BITMAP_BPP);
         point.r = triplet[0];
@@ -316,8 +325,7 @@ static void read_data(const char *input_path, const char *filters)
             }
         }
 
-        MPI_Check(MPI_Send(
-            &point, sizeof(point), MPI_UNSIGNED_CHAR, 0, 0, parent_comm));
+        MPI_Check(MPI_Send(&point, 1, g_point_type, 0, 0, parent_comm));
     }
 
     free(buf);
@@ -363,6 +371,24 @@ int main(int argc, char **argv)
     MPI_Check(MPI_Comm_rank(MPI_COMM_WORLD, &g_rank));
     MPI_Check(MPI_Comm_size(MPI_COMM_WORLD, &g_size));
 
+    struct rgb_point point_dummy;
+    int point_count = 5;
+    int block_lengths[] = { 1, 1, 1, 1, 1 };
+    MPI_Aint block_offsets[] = {
+        (ptrdiff_t)&point_dummy.x - (ptrdiff_t)&point_dummy,
+        (ptrdiff_t)&point_dummy.y - (ptrdiff_t)&point_dummy,
+        (ptrdiff_t)&point_dummy.r - (ptrdiff_t)&point_dummy,
+        (ptrdiff_t)&point_dummy.g - (ptrdiff_t)&point_dummy,
+        (ptrdiff_t)&point_dummy.b - (ptrdiff_t)&point_dummy,
+    };
+    MPI_Datatype block_types[] = { MPI_UNSIGNED_SHORT, MPI_UNSIGNED_SHORT,
+                                   MPI_BYTE, MPI_BYTE, MPI_BYTE };
+
+    MPI_Check(MPI_Type_create_struct(
+        point_count, block_lengths, block_offsets, block_types,
+        &g_point_type));
+    MPI_Check(MPI_Type_commit(&g_point_type));
+
     MPI_Comm parent_comm;
     MPI_Check(MPI_Comm_get_parent(&parent_comm));
 
@@ -387,18 +413,19 @@ int main(int argc, char **argv)
             children_argv[2] = argv[3];
         }
 
-        MPI_Check(MPI_Comm_spawn(argv[0], children_argv, num_workers,
-            MPI_INFO_NULL, 0, MPI_COMM_WORLD, &child_comm, MPI_ERRCODES_IGNORE));
+        MPI_Check(
+            MPI_Comm_spawn(argv[0], children_argv, num_workers, MPI_INFO_NULL,
+                0, MPI_COMM_WORLD, &child_comm, MPI_ERRCODES_IGNORE));
 
         /* Perform rendering. */
         perform_rendering(&child_comm);
     } else {
-       /* Obtain filter string from command line arguments. */
+        /* Obtain filter string from command line arguments. */
         char *filter = NULL;
         if (argc > 3)
             filter = argv[3];
 
-         /* Perform parallel read. */
+        /* Perform parallel read. */
         read_data(argv[2], filter);
     }
 
